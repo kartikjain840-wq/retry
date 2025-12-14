@@ -1,25 +1,26 @@
 import streamlit as st
 import os
+import json
+import time
+import sqlite3
 import pdfplumber
 import docx
 from pptx import Presentation
-import sqlite3
 import pandas as pd
-import json
 from openai import OpenAI
+from openai import RateLimitError
 
-# ---------------- CONFIG ---------------- #
-st.set_page_config("AI Document Intelligence Dashboard", layout="wide")
+# ---------------- PAGE CONFIG ----------------
+st.set_page_config(
+    page_title="AI Document Intelligence Dashboard",
+    layout="wide"
+)
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+# ---------------- OPENAI CLIENT ----------------
+client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
 
-DB_PATH = "doc_data.db"
-DOC_FOLDER = "documents"
-
-os.makedirs(DOC_FOLDER, exist_ok=True)
-
-# ---------------- DATABASE ---------------- #
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+# ---------------- DATABASE (LOCAL, SAFE) ----------------
+conn = sqlite3.connect("documents.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -31,99 +32,99 @@ CREATE TABLE IF NOT EXISTS documents (
     results TEXT,
     industry TEXT,
     region TEXT,
-    client_type TEXT,
-    full_text TEXT
+    client_type TEXT
 )
 """)
 conn.commit()
 
-# ---------------- TEXT EXTRACTORS ---------------- #
-def extract_pdf(path):
+# ---------------- TEXT EXTRACTION ----------------
+def extract_text(file, filetype):
     text = ""
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() or ""
-    return text
 
-def extract_docx(path):
-    doc = docx.Document(path)
-    return "\n".join([p.text for p in doc.paragraphs])
+    if filetype == "pdf":
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
 
-def extract_pptx(path):
-    prs = Presentation(path)
-    text = ""
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if hasattr(shape, "text"):
-                text += shape.text + "\n"
-    return text
+    elif filetype == "docx":
+        doc = docx.Document(file)
+        text = "\n".join(p.text for p in doc.paragraphs)
 
-def extract_text(file_path):
-    if file_path.endswith(".pdf"):
-        return extract_pdf(file_path)
-    if file_path.endswith(".docx"):
-        return extract_docx(file_path)
-    if file_path.endswith(".pptx"):
-        return extract_pptx(file_path)
-    return ""
+    elif filetype == "pptx":
+        prs = Presentation(file)
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    text += shape.text + "\n"
 
-# ---------------- AI EXTRACTION ---------------- #
+    return text[:10000]  # token safety
+
+# ---------------- AI EXTRACTION (RATE SAFE) ----------------
 def ai_extract(text):
     prompt = f"""
-    You are a management consulting analyst.
+You are a management consulting analyst.
 
-    From the document text below, extract:
-    1. Objective
-    2. Tools / Frameworks Used
-    3. Results / Impact
-    4. Industry
-    5. Region / Geography
-    6. Client Type
+Extract the following and return STRICT JSON only:
+{{
+  "objective": "",
+  "tools": "",
+  "results": "",
+  "industry": "",
+  "region": "",
+  "client_type": ""
+}}
 
-    Return STRICT JSON with keys:
-    objective, tools, results, industry, region, client_type
+TEXT:
+{text}
+"""
 
-    TEXT:
-    {text[:12000]}
-    """
+    for _ in range(3):  # retry protection
+        try:
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            return json.loads(response.choices[0].message.content)
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+        except RateLimitError:
+            time.sleep(5)
 
-    return json.loads(response.choices[0].message.content)
+    return {
+        "objective": "Rate limit / quota issue",
+        "tools": "Rate limit / quota issue",
+        "results": "Rate limit / quota issue",
+        "industry": "Rate limit / quota issue",
+        "region": "Rate limit / quota issue",
+        "client_type": "Rate limit / quota issue"
+    }
 
-# ---------------- UI ---------------- #
+# ---------------- UI ----------------
 st.title("📊 AI Document Intelligence Dashboard")
 
 tab1, tab2 = st.tabs(["📂 Upload & Process", "📈 Dashboard"])
 
-# ---------------- UPLOAD TAB ---------------- #
+# ---------------- TAB 1 ----------------
 with tab1:
-    st.subheader("Upload Documents")
+    st.subheader("Upload Consulting Case Documents")
 
     uploaded_files = st.file_uploader(
-        "Upload PDF / PPT / DOCX",
-        type=["pdf", "pptx", "docx"],
+        "Upload PDF / DOCX / PPTX",
+        type=["pdf", "docx", "pptx"],
         accept_multiple_files=True
     )
 
-    if uploaded_files:
+    if uploaded_files and st.button("🚀 Process Documents"):
         for file in uploaded_files:
-            path = os.path.join(DOC_FOLDER, file.name)
-            with open(path, "wb") as f:
-                f.write(file.getbuffer())
-
-            text = extract_text(path)
+            filetype = file.name.split(".")[-1].lower()
+            text = extract_text(file, filetype)
 
             ai_data = ai_extract(text)
 
             cursor.execute("""
-            INSERT INTO documents
-            (filename, objective, tools, results, industry, region, client_type, full_text)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO documents
+                (filename, objective, tools, results, industry, region, client_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 file.name,
                 ai_data["objective"],
@@ -131,14 +132,13 @@ with tab1:
                 ai_data["results"],
                 ai_data["industry"],
                 ai_data["region"],
-                ai_data["client_type"],
-                text
+                ai_data["client_type"]
             ))
             conn.commit()
 
-        st.success("Documents processed successfully!")
+        st.success("✅ Documents processed successfully!")
 
-# ---------------- DASHBOARD TAB ---------------- #
+# ---------------- TAB 2 ----------------
 with tab2:
     df = pd.read_sql("SELECT * FROM documents", conn)
 
@@ -148,13 +148,11 @@ with tab2:
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            region_filter = st.multiselect("Filter by Region", df["region"].unique())
-
+            region_filter = st.multiselect("Region", df["region"].unique())
         with col2:
-            industry_filter = st.multiselect("Filter by Industry", df["industry"].unique())
-
+            industry_filter = st.multiselect("Industry", df["industry"].unique())
         with col3:
-            tool_filter = st.multiselect("Filter by Tools", df["tools"].unique())
+            tool_filter = st.multiselect("Tools", df["tools"].unique())
 
         if region_filter:
             df = df[df["region"].isin(region_filter)]
@@ -168,15 +166,13 @@ with tab2:
             use_container_width=True
         )
 
-        st.subheader("📄 Document Details")
+        selected = st.selectbox("Select a document", df["filename"])
 
-        selected = st.selectbox("Select document", df["filename"])
+        row = df[df["filename"] == selected].iloc[0]
 
-        doc = df[df["filename"] == selected].iloc[0]
-
-        st.markdown(f"### 🎯 Objective\n{doc['objective']}")
-        st.markdown(f"### 🛠 Tools Used\n{doc['tools']}")
-        st.markdown(f"### 📈 Results\n{doc['results']}")
-        st.markdown(f"### 🌍 Region\n{doc['region']}")
-        st.markdown(f"### 🏭 Industry\n{doc['industry']}")
-        st.markdown(f"### 👥 Client Type\n{doc['client_type']}")
+        st.markdown(f"### 🎯 Objective\n{row['objective']}")
+        st.markdown(f"### 🛠 Tools\n{row['tools']}")
+        st.markdown(f"### 📈 Results\n{row['results']}")
+        st.markdown(f"### 🏭 Industry\n{row['industry']}")
+        st.markdown(f"### 🌍 Region\n{row['region']}")
+        st.markdown(f"### 👥 Client Type\n{row['client_type']}")
