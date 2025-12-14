@@ -4,4 +4,4 @@ pdfplumber
 python-pptx
 python-docx
 pandas
-sqlite3
+
