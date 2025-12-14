@@ -1,5 +1,4 @@
 import streamlit as st
-import os
 import json
 import time
 import sqlite3
@@ -32,6 +31,18 @@ CREATE TABLE IF NOT EXISTS documents (
 """)
 conn.commit()
 
+# ---------------- SAFE JSON PARSER ----------------
+def safe_json_list(value):
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return parsed
+        return [str(parsed)]
+    except Exception:
+        return [value]
+
 # ---------------- TEXT EXTRACTION ----------------
 def extract_text(file, filetype):
     text = ""
@@ -59,8 +70,8 @@ def ai_extract(text):
     prompt = f"""
 You are a management consulting analyst.
 
-Extract information and return STRICT JSON.
-Write Objective, Tools, and Results as BULLET POINTS.
+Return STRICT JSON.
+Objective, Tools, Results MUST be bullet lists.
 
 {{
   "objective": ["point 1", "point 2"],
@@ -85,14 +96,23 @@ TEXT:
             return json.loads(response.choices[0].message.content)
         except RateLimitError:
             time.sleep(5)
+        except Exception:
+            break
 
-    return None
+    return {
+        "objective": ["AI extraction failed"],
+        "tools": ["AI extraction failed"],
+        "results": ["AI extraction failed"],
+        "industry": "Unknown",
+        "region": "Unknown",
+        "client_type": "Unknown"
+    }
 
 # ---------------- UI ----------------
 st.title("📊 AI Document Intelligence Dashboard")
 
 # 🔍 SEARCH BAR (TOP)
-search_query = st.text_input("🔍 Search across case studies (file name, objective, tools, results)")
+search_query = st.text_input("🔍 Search across case studies")
 
 tab1, tab2 = st.tabs(["📂 Upload & Process", "📈 Dashboard"])
 
@@ -108,7 +128,7 @@ with tab1:
         for file in uploaded_files:
             filename = file.name
 
-            # 🚫 Prevent duplicate insertion
+            # Prevent duplicates
             cursor.execute("SELECT 1 FROM documents WHERE filename=?", (filename,))
             if cursor.fetchone():
                 continue
@@ -116,9 +136,6 @@ with tab1:
             filetype = filename.split(".")[-1].lower()
             text = extract_text(file, filetype)
             ai_data = ai_extract(text)
-
-            if not ai_data:
-                continue
 
             cursor.execute("""
                 INSERT INTO documents
@@ -144,14 +161,11 @@ with tab2:
     if df.empty:
         st.info("No documents processed yet.")
     else:
-        # 🔍 SEARCH FILTER
         if search_query:
-            df = df[
-                df.apply(
-                    lambda row: search_query.lower() in " ".join(row.astype(str)).lower(),
-                    axis=1
-                )
-            ]
+            df = df[df.apply(
+                lambda r: search_query.lower() in " ".join(r.astype(str)).lower(),
+                axis=1
+            )]
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -176,17 +190,16 @@ with tab2:
         selected = st.selectbox("Select a document", df["filename"].unique())
         row = df[df["filename"] == selected].iloc[0]
 
-        # 🔹 BULLET POINT DISPLAY
         st.markdown("### 🎯 Objective")
-        for o in json.loads(row["objective"]):
+        for o in safe_json_list(row["objective"]):
             st.markdown(f"- {o}")
 
         st.markdown("### 🛠 Tools Used")
-        for t in json.loads(row["tools"]):
+        for t in safe_json_list(row["tools"]):
             st.markdown(f"- {t}")
 
         st.markdown("### 📈 Results")
-        for r in json.loads(row["results"]):
+        for r in safe_json_list(row["results"]):
             st.markdown(f"- {r}")
 
         st.markdown(f"### 🏭 Industry\n{row['industry']}")
