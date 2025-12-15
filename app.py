@@ -41,11 +41,14 @@ def safe_json_list(value):
             return parsed
         return [str(parsed)]
     except Exception:
-        return [value]
+        return [str(value)]
 
+# ✅ FINAL BULLET FIX (NO COMMAS)
 def bullets_to_text(value):
     items = safe_json_list(value)
-    return "\n• " + "\n• ".join(items) if items else ""
+    if not items:
+        return ""
+    return "• " + "\n• ".join([str(i).strip() for i in items])
 
 # ---------------- TEXT EXTRACTION ----------------
 def extract_text(file, filetype):
@@ -150,7 +153,7 @@ with tab1:
 
 # ---------------- TAB 2 ----------------
 with tab2:
-    # 🔒 HARD DUPLICATE REMOVAL
+    # 🔒 REMOVE DUPLICATES (LATEST ENTRY ONLY)
     df = pd.read_sql("""
         SELECT *
         FROM documents
@@ -161,18 +164,17 @@ with tab2:
     if df.empty:
         st.info("No documents processed yet.")
     else:
-        # 🔍 SEARCH FILTER
         if search_query:
             df = df[df.apply(
                 lambda r: search_query.lower() in " ".join(r.astype(str)).lower(),
                 axis=1
             )]
 
-        # Prepare table-friendly columns
+        # Prepare table columns
         df["Objectives"] = df["objective"].apply(bullets_to_text)
         df["Results"] = df["results"].apply(bullets_to_text)
 
-        # 🧩 AUTO-WRAP STYLES
+        # 🔹 AUTO-WRAP TABLE CELLS
         st.markdown(
             """
             <style>
