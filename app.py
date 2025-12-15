@@ -43,20 +43,25 @@ def safe_json_list(value):
     except Exception:
         return [str(value)]
 
-# ✅ FINAL BULLET LOGIC (COMMA → NEW BULLET)
-def bullets_to_text(value):
-    items = safe_json_list(value)
+# ---------------- BULLET NORMALIZATION ----------------
+# Rule:
+# - split on commas
+# - each bullet on its own line
+def normalize_bullets(value):
+    raw_items = safe_json_list(value)
     bullets = []
 
-    for item in items:
-        # Split on commas and clean each part
-        parts = [p.strip().capitalize() for p in str(item).split(",") if p.strip()]
+    for item in raw_items:
+        parts = [p.strip() for p in str(item).split(",") if p.strip()]
         bullets.extend(parts)
 
+    return bullets
+
+def bullets_to_text(value):
+    bullets = normalize_bullets(value)
     if not bullets:
         return ""
-
-    return "• " + "\n• ".join(bullets)
+    return "\n".join([f"• {b}" for b in bullets])
 
 # ---------------- TEXT EXTRACTION ----------------
 def extract_text(file, filetype):
@@ -161,7 +166,7 @@ with tab1:
 
 # ---------------- TAB 2 ----------------
 with tab2:
-    # 🔒 REMOVE DUPLICATES (LATEST ENTRY ONLY)
+    # Remove duplicates (latest only)
     df = pd.read_sql("""
         SELECT *
         FROM documents
@@ -178,11 +183,10 @@ with tab2:
                 axis=1
             )]
 
-        # Prepare table columns
         df["Objectives"] = df["objective"].apply(bullets_to_text)
         df["Results"] = df["results"].apply(bullets_to_text)
 
-        # 🔹 AUTO-WRAP TABLE CELLS
+        # Auto-wrap table cells
         st.markdown(
             """
             <style>
@@ -213,16 +217,16 @@ with tab2:
         row = df[df["filename"] == selected].iloc[0]
 
         st.markdown("### 🎯 Objective")
-        for o in bullets_to_text(row["objective"]).split("\n"):
-            st.markdown(o)
+        for b in normalize_bullets(row["objective"]):
+            st.markdown(f"• {b}")
 
         st.markdown("### 🛠 Tools Used")
         for t in safe_json_list(row["tools"]):
             st.markdown(f"- {t}")
 
         st.markdown("### 📈 Results")
-        for r in bullets_to_text(row["results"]).split("\n"):
-            st.markdown(r)
+        for b in normalize_bullets(row["results"]):
+            st.markdown(f"• {b}")
 
         st.markdown(f"### 🏭 Industry\n{row['industry']}")
         st.markdown(f"### 🌍 Region\n{row['region']}")
