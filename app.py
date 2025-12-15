@@ -43,12 +43,20 @@ def safe_json_list(value):
     except Exception:
         return [str(value)]
 
-# ✅ FINAL BULLET FIX (NO COMMAS)
+# ✅ FINAL BULLET LOGIC (COMMA → NEW BULLET)
 def bullets_to_text(value):
     items = safe_json_list(value)
-    if not items:
+    bullets = []
+
+    for item in items:
+        # Split on commas and clean each part
+        parts = [p.strip().capitalize() for p in str(item).split(",") if p.strip()]
+        bullets.extend(parts)
+
+    if not bullets:
         return ""
-    return "• " + "\n• ".join([str(i).strip() for i in items])
+
+    return "• " + "\n• ".join(bullets)
 
 # ---------------- TEXT EXTRACTION ----------------
 def extract_text(file, filetype):
@@ -205,16 +213,16 @@ with tab2:
         row = df[df["filename"] == selected].iloc[0]
 
         st.markdown("### 🎯 Objective")
-        for o in safe_json_list(row["objective"]):
-            st.markdown(f"- {o}")
+        for o in bullets_to_text(row["objective"]).split("\n"):
+            st.markdown(o)
 
         st.markdown("### 🛠 Tools Used")
         for t in safe_json_list(row["tools"]):
             st.markdown(f"- {t}")
 
         st.markdown("### 📈 Results")
-        for r in safe_json_list(row["results"]):
-            st.markdown(f"- {r}")
+        for r in bullets_to_text(row["results"]).split("\n"):
+            st.markdown(r)
 
         st.markdown(f"### 🏭 Industry\n{row['industry']}")
         st.markdown(f"### 🌍 Region\n{row['region']}")
