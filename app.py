@@ -20,7 +20,7 @@ cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename TEXT UNIQUE,
+    filename TEXT,
     objective TEXT,
     tools TEXT,
     results TEXT,
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS documents (
 """)
 conn.commit()
 
-# ---------------- SAFE JSON PARSER ----------------
+# ---------------- SAFE JSON HANDLING ----------------
 def safe_json_list(value):
     if not value:
         return []
@@ -43,26 +43,26 @@ def safe_json_list(value):
     except Exception:
         return [value]
 
+def bullets_to_text(value):
+    items = safe_json_list(value)
+    return "\n• " + "\n• ".join(items) if items else ""
+
 # ---------------- TEXT EXTRACTION ----------------
 def extract_text(file, filetype):
     text = ""
-
     if filetype == "pdf":
         with pdfplumber.open(file) as pdf:
             for page in pdf.pages:
                 text += page.extract_text() or ""
-
     elif filetype == "docx":
         doc = docx.Document(file)
         text = "\n".join(p.text for p in doc.paragraphs)
-
     elif filetype == "pptx":
         prs = Presentation(file)
         for slide in prs.slides:
             for shape in slide.shapes:
                 if hasattr(shape, "text"):
                     text += shape.text + "\n"
-
     return text[:10000]
 
 # ---------------- AI EXTRACTION ----------------
@@ -71,7 +71,7 @@ def ai_extract(text):
 You are a management consulting analyst.
 
 Return STRICT JSON.
-Objective, Tools, Results MUST be bullet lists.
+Objective, Tools, Results must be bullet lists.
 
 {{
   "objective": ["point 1", "point 2"],
@@ -85,7 +85,6 @@ Objective, Tools, Results MUST be bullet lists.
 TEXT:
 {text}
 """
-
     for _ in range(3):
         try:
             response = client.chat.completions.create(
@@ -111,7 +110,7 @@ TEXT:
 # ---------------- UI ----------------
 st.title("📊 AI Document Intelligence Dashboard")
 
-# 🔍 SEARCH BAR (TOP)
+# 🔍 SEARCH BAR
 search_query = st.text_input("🔍 Search across case studies")
 
 tab1, tab2 = st.tabs(["📂 Upload & Process", "📈 Dashboard"])
@@ -127,13 +126,8 @@ with tab1:
     if uploaded_files and st.button("🚀 Process Documents"):
         for file in uploaded_files:
             filename = file.name
-
-            # Prevent duplicates
-            cursor.execute("SELECT 1 FROM documents WHERE filename=?", (filename,))
-            if cursor.fetchone():
-                continue
-
             filetype = filename.split(".")[-1].lower()
+
             text = extract_text(file, filetype)
             ai_data = ai_extract(text)
 
@@ -152,39 +146,57 @@ with tab1:
             ))
             conn.commit()
 
-        st.success("✅ Documents processed (duplicates skipped).")
+        st.success("✅ Documents processed")
 
 # ---------------- TAB 2 ----------------
 with tab2:
-    df = pd.read_sql("SELECT * FROM documents", conn)
+    # 🔒 HARD DUPLICATE REMOVAL
+    df = pd.read_sql("""
+        SELECT *
+        FROM documents
+        GROUP BY filename
+        ORDER BY id DESC
+    """, conn)
 
     if df.empty:
         st.info("No documents processed yet.")
     else:
+        # 🔍 SEARCH FILTER
         if search_query:
             df = df[df.apply(
                 lambda r: search_query.lower() in " ".join(r.astype(str)).lower(),
                 axis=1
             )]
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            region_filter = st.multiselect("Region", df["region"].unique())
-        with col2:
-            industry_filter = st.multiselect("Industry", df["industry"].unique())
-        with col3:
-            tool_filter = st.multiselect("Tools", df["tools"].unique())
+        # Prepare table-friendly columns
+        df["Objectives"] = df["objective"].apply(bullets_to_text)
+        df["Results"] = df["results"].apply(bullets_to_text)
 
-        if region_filter:
-            df = df[df["region"].isin(region_filter)]
-        if industry_filter:
-            df = df[df["industry"].isin(industry_filter)]
-        if tool_filter:
-            df = df[df["tools"].isin(tool_filter)]
+        # 🧩 AUTO-WRAP STYLES
+        st.markdown(
+            """
+            <style>
+            .stDataFrame td {
+                white-space: pre-wrap !important;
+                word-wrap: break-word !important;
+                max-width: 600px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
 
         st.dataframe(
-            df[["filename", "industry", "region", "client_type"]],
-            use_container_width=True
+            df[[
+                "filename",
+                "Objectives",
+                "Results",
+                "industry",
+                "region",
+                "client_type"
+            ]],
+            use_container_width=True,
+            hide_index=True
         )
 
         selected = st.selectbox("Select a document", df["filename"].unique())
