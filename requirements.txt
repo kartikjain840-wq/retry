@@ -1,7 +1,9 @@
 streamlit
 openai
 pdfplumber
-python-pptx
 python-docx
+python-pptx
 pandas
-
+sentence-transformers
+faiss-cpu
+numpy
