@@ -4,6 +4,6 @@ pdfplumber
 python-docx
 python-pptx
 pandas
+numpy
 sentence-transformers
 faiss-cpu
-numpy
