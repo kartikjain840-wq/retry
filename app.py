@@ -6,11 +6,13 @@ import pdfplumber
 import docx
 from pptx import Presentation
 import pandas as pd
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 from openai import OpenAI, RateLimitError
 
 # ---------------- PAGE CONFIG ----------------
 st.set_page_config(page_title="AI Document Intelligence Dashboard", layout="wide")
-
 client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
 
 # ---------------- DATABASE ----------------
@@ -31,7 +33,7 @@ CREATE TABLE IF NOT EXISTS documents (
 """)
 conn.commit()
 
-# ---------------- SAFE JSON HANDLING ----------------
+# ---------------- SAFE JSON ----------------
 def safe_json_list(value):
     if not value:
         return []
@@ -44,24 +46,16 @@ def safe_json_list(value):
         return [str(value)]
 
 # ---------------- BULLET NORMALIZATION ----------------
-# Rule:
-# - split on commas
-# - each bullet on its own line
 def normalize_bullets(value):
-    raw_items = safe_json_list(value)
+    raw = safe_json_list(value)
     bullets = []
-
-    for item in raw_items:
-        parts = [p.strip() for p in str(item).split(",") if p.strip()]
+    for r in raw:
+        parts = [p.strip() for p in str(r).split(",") if p.strip()]
         bullets.extend(parts)
-
     return bullets
 
 def bullets_to_text(value):
-    bullets = normalize_bullets(value)
-    if not bullets:
-        return ""
-    return "\n".join([f"• {b}" for b in bullets])
+    return "<br>".join([f"• {b}" for b in normalize_bullets(value)])
 
 # ---------------- TEXT EXTRACTION ----------------
 def extract_text(file, filetype):
@@ -79,20 +73,17 @@ def extract_text(file, filetype):
             for shape in slide.shapes:
                 if hasattr(shape, "text"):
                     text += shape.text + "\n"
-    return text[:10000]
+    return text[:12000]
 
 # ---------------- AI EXTRACTION ----------------
 def ai_extract(text):
     prompt = f"""
-You are a management consulting analyst.
-
-Return STRICT JSON.
-Objective, Tools, Results must be bullet lists.
+Return STRICT JSON. Objective, Tools, Results as bullet lists.
 
 {{
-  "objective": ["point 1", "point 2"],
-  "tools": ["tool 1", "tool 2"],
-  "results": ["result 1", "result 2"],
+  "objective": [],
+  "tools": [],
+  "results": [],
   "industry": "",
   "region": "",
   "client_type": ""
@@ -103,17 +94,14 @@ TEXT:
 """
     for _ in range(3):
         try:
-            response = client.chat.completions.create(
+            r = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0
             )
-            return json.loads(response.choices[0].message.content)
+            return json.loads(r.choices[0].message.content)
         except RateLimitError:
             time.sleep(5)
-        except Exception:
-            break
-
     return {
         "objective": ["AI extraction failed"],
         "tools": ["AI extraction failed"],
@@ -123,10 +111,18 @@ TEXT:
         "client_type": "Unknown"
     }
 
+# ---------------- CONSULTANT'S BRAIN (RAG) ----------------
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+embedding_model = load_embedding_model()
+faiss_index = faiss.IndexFlatL2(384)
+faiss_text_map = []
+
 # ---------------- UI ----------------
 st.title("📊 AI Document Intelligence Dashboard")
 
-# 🔍 SEARCH BAR
 search_query = st.text_input("🔍 Search across case studies")
 
 tab1, tab2 = st.tabs(["📂 Upload & Process", "📈 Dashboard"])
@@ -143,7 +139,6 @@ with tab1:
         for file in uploaded_files:
             filename = file.name
             filetype = filename.split(".")[-1].lower()
-
             text = extract_text(file, filetype)
             ai_data = ai_extract(text)
 
@@ -162,11 +157,17 @@ with tab1:
             ))
             conn.commit()
 
+            # ---- RAG VECTOR STORAGE (ADDITION ONLY) ----
+            for chunk in text.split("\n"):
+                if len(chunk.strip()) > 60:
+                    vec = embedding_model.encode(chunk)
+                    faiss_index.add(np.array([vec]).astype("float32"))
+                    faiss_text_map.append(chunk)
+
         st.success("✅ Documents processed")
 
 # ---------------- TAB 2 ----------------
 with tab2:
-    # Remove duplicates (latest only)
     df = pd.read_sql("""
         SELECT *
         FROM documents
@@ -177,6 +178,30 @@ with tab2:
     if df.empty:
         st.info("No documents processed yet.")
     else:
+        # ---------------- INSIGHT CARDS ----------------
+        st.markdown("## 📊 Executive Snapshot")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("📚 Knowledge Base", f"{len(df)} Case Studies")
+        c2.metric("🏭 Top Industry", df["industry"].mode()[0] if not df.empty else "N/A")
+        c3.metric(
+            "🛠️ Most Used Tool",
+            pd.Series(sum([safe_json_list(t) for t in df["tools"]], [])).mode()[0]
+            if not df.empty else "N/A"
+        )
+        st.markdown("---")
+
+        # ---------------- FILTERS ----------------
+        f1, f2 = st.columns(2)
+        with f1:
+            regions = st.multiselect("Filter by Region", sorted(df["region"].dropna().unique()))
+        with f2:
+            industries = st.multiselect("Filter by Industry", sorted(df["industry"].dropna().unique()))
+
+        if regions:
+            df = df[df["region"].isin(regions)]
+        if industries:
+            df = df[df["industry"].isin(industries)]
+
         if search_query:
             df = df[df.apply(
                 lambda r: search_query.lower() in " ".join(r.astype(str)).lower(),
@@ -186,21 +211,8 @@ with tab2:
         df["Objectives"] = df["objective"].apply(bullets_to_text)
         df["Results"] = df["results"].apply(bullets_to_text)
 
-        # Auto-wrap table cells
+        # ---------------- TABLE (UNCHANGED RENDER STRATEGY) ----------------
         st.markdown(
-            """
-            <style>
-            .stDataFrame td {
-                white-space: pre-wrap !important;
-                word-wrap: break-word !important;
-                max-width: 600px;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-
-        st.dataframe(
             df[[
                 "filename",
                 "Objectives",
@@ -208,26 +220,36 @@ with tab2:
                 "industry",
                 "region",
                 "client_type"
-            ]],
-            use_container_width=True,
-            hide_index=True
+            ]].to_html(escape=False, index=False),
+            unsafe_allow_html=True
         )
 
-        selected = st.selectbox("Select a document", df["filename"].unique())
-        row = df[df["filename"] == selected].iloc[0]
+        # ---------------- CONSULTANT'S BRAIN ----------------
+        st.markdown("## 🧠 Consultant’s Brain (Ask Like a Partner)")
+        user_q = st.text_input(
+            "Ask a strategic question",
+            placeholder="How did we optimize inventory for manufacturing clients?"
+        )
 
-        st.markdown("### 🎯 Objective")
-        for b in normalize_bullets(row["objective"]):
-            st.markdown(f"• {b}")
+        if user_q:
+            q_vec = embedding_model.encode(user_q)
+            D, I = faiss_index.search(np.array([q_vec]).astype("float32"), k=5)
+            context = "\n".join([faiss_text_map[i] for i in I[0] if i < len(faiss_text_map)])
 
-        st.markdown("### 🛠 Tools Used")
-        for t in safe_json_list(row["tools"]):
-            st.markdown(f"- {t}")
+            rag_prompt = f"""
+You are a senior consulting partner.
+Synthesize an answer using the evidence below.
 
-        st.markdown("### 📈 Results")
-        for b in normalize_bullets(row["results"]):
-            st.markdown(f"• {b}")
+QUESTION:
+{user_q}
 
-        st.markdown(f"### 🏭 Industry\n{row['industry']}")
-        st.markdown(f"### 🌍 Region\n{row['region']}")
-        st.markdown(f"### 👥 Client Type\n{row['client_type']}")
+EVIDENCE:
+{context}
+"""
+            resp = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": rag_prompt}],
+                temperature=0.2
+            )
+            st.markdown("### 🔍 Partner Synthesis")
+            st.write(resp.choices[0].message.content)
