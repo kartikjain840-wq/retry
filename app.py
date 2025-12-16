@@ -7,9 +7,8 @@ import docx
 from pptx import Presentation
 import pandas as pd
 import numpy as np
+from io import BytesIO
 from openai import OpenAI, RateLimitError
-
-# RAG imports (lazy loaded later)
 from sentence_transformers import SentenceTransformer
 import faiss
 
@@ -160,7 +159,6 @@ with tab1:
             ))
             conn.commit()
 
-            # ---- RAG indexing (lazy, safe) ----
             for chunk in text.split("\n"):
                 if len(chunk.strip()) > 60:
                     vec = embedding_model.encode(chunk)
@@ -213,16 +211,50 @@ with tab2:
         df["Objectives"] = df["objective"].apply(bullets_to_html)
         df["Results"] = df["results"].apply(bullets_to_html)
 
-        # -------- TABLE (HTML RENDER FOR MULTILINE) --------
+        table_df = df[[
+            "filename",
+            "Objectives",
+            "Results",
+            "industry",
+            "region",
+            "client_type"
+        ]]
+
+        # -------- DOWNLOAD AS XLSX (ADDITION ONLY) --------
+        output = BytesIO()
+        export_df = table_df.copy()
+        export_df["Objectives"] = export_df["Objectives"].str.replace("<br>", "\n", regex=False)
+        export_df["Results"] = export_df["Results"].str.replace("<br>", "\n", regex=False)
+        export_df.to_excel(output, index=False, sheet_name="Dashboard")
+        output.seek(0)
+
+        st.download_button(
+            label="⬇️ Download Dashboard (XLSX)",
+            data=output,
+            file_name="dashboard_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        # -------- CENTER-ALIGNED TABLE (HTML) --------
         st.markdown(
-            df[[
-                "filename",
-                "Objectives",
-                "Results",
-                "industry",
-                "region",
-                "client_type"
-            ]].to_html(escape=False, index=False),
+            """
+            <style>
+            table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+            th, td {
+                text-align: center !important;
+                vertical-align: middle !important;
+                padding: 10px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            table_df.to_html(escape=False, index=False),
             unsafe_allow_html=True
         )
 
