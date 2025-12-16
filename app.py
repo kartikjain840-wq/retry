@@ -7,9 +7,11 @@ import docx
 from pptx import Presentation
 import pandas as pd
 import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI, RateLimitError
+
+# RAG imports (lazy loaded later)
+from sentence_transformers import SentenceTransformer
+import faiss
 
 # ---------------- PAGE CONFIG ----------------
 st.set_page_config(page_title="AI Document Intelligence Dashboard", layout="wide")
@@ -39,22 +41,19 @@ def safe_json_list(value):
         return []
     try:
         parsed = json.loads(value)
-        if isinstance(parsed, list):
-            return parsed
-        return [str(parsed)]
+        return parsed if isinstance(parsed, list) else [str(parsed)]
     except Exception:
         return [str(value)]
 
 # ---------------- BULLET NORMALIZATION ----------------
 def normalize_bullets(value):
-    raw = safe_json_list(value)
     bullets = []
-    for r in raw:
-        parts = [p.strip() for p in str(r).split(",") if p.strip()]
+    for item in safe_json_list(value):
+        parts = [p.strip() for p in str(item).split(",") if p.strip()]
         bullets.extend(parts)
     return bullets
 
-def bullets_to_text(value):
+def bullets_to_html(value):
     return "<br>".join([f"• {b}" for b in normalize_bullets(value)])
 
 # ---------------- TEXT EXTRACTION ----------------
@@ -78,7 +77,8 @@ def extract_text(file, filetype):
 # ---------------- AI EXTRACTION ----------------
 def ai_extract(text):
     prompt = f"""
-Return STRICT JSON. Objective, Tools, Results as bullet lists.
+Return STRICT JSON.
+Objective, Tools, Results as bullet lists.
 
 {{
   "objective": [],
@@ -102,6 +102,7 @@ TEXT:
             return json.loads(r.choices[0].message.content)
         except RateLimitError:
             time.sleep(5)
+
     return {
         "objective": ["AI extraction failed"],
         "tools": ["AI extraction failed"],
@@ -111,14 +112,13 @@ TEXT:
         "client_type": "Unknown"
     }
 
-# ---------------- CONSULTANT'S BRAIN (RAG) ----------------
+# ---------------- CONSULTANT'S BRAIN (LAZY RAG) ----------------
 @st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-embedding_model = load_embedding_model()
-faiss_index = faiss.IndexFlatL2(384)
-faiss_text_map = []
+def get_rag_components():
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    index = faiss.IndexFlatL2(384)
+    text_map = []
+    return model, index, text_map
 
 # ---------------- UI ----------------
 st.title("📊 AI Document Intelligence Dashboard")
@@ -136,10 +136,13 @@ with tab1:
     )
 
     if uploaded_files and st.button("🚀 Process Documents"):
+        embedding_model, faiss_index, faiss_text_map = get_rag_components()
+
         for file in uploaded_files:
             filename = file.name
             filetype = filename.split(".")[-1].lower()
             text = extract_text(file, filetype)
+
             ai_data = ai_extract(text)
 
             cursor.execute("""
@@ -157,14 +160,14 @@ with tab1:
             ))
             conn.commit()
 
-            # ---- RAG VECTOR STORAGE (ADDITION ONLY) ----
+            # ---- RAG indexing (lazy, safe) ----
             for chunk in text.split("\n"):
                 if len(chunk.strip()) > 60:
                     vec = embedding_model.encode(chunk)
                     faiss_index.add(np.array([vec]).astype("float32"))
                     faiss_text_map.append(chunk)
 
-        st.success("✅ Documents processed")
+        st.success("✅ Documents processed and indexed")
 
 # ---------------- TAB 2 ----------------
 with tab2:
@@ -178,24 +181,23 @@ with tab2:
     if df.empty:
         st.info("No documents processed yet.")
     else:
-        # ---------------- INSIGHT CARDS ----------------
+        # -------- INSIGHT CARDS --------
         st.markdown("## 📊 Executive Snapshot")
         c1, c2, c3 = st.columns(3)
         c1.metric("📚 Knowledge Base", f"{len(df)} Case Studies")
-        c2.metric("🏭 Top Industry", df["industry"].mode()[0] if not df.empty else "N/A")
+        c2.metric("🏭 Top Industry", df["industry"].mode()[0])
         c3.metric(
             "🛠️ Most Used Tool",
             pd.Series(sum([safe_json_list(t) for t in df["tools"]], [])).mode()[0]
-            if not df.empty else "N/A"
         )
         st.markdown("---")
 
-        # ---------------- FILTERS ----------------
+        # -------- FILTERS --------
         f1, f2 = st.columns(2)
         with f1:
-            regions = st.multiselect("Filter by Region", sorted(df["region"].dropna().unique()))
+            regions = st.multiselect("Filter by Region", sorted(df["region"].unique()))
         with f2:
-            industries = st.multiselect("Filter by Industry", sorted(df["industry"].dropna().unique()))
+            industries = st.multiselect("Filter by Industry", sorted(df["industry"].unique()))
 
         if regions:
             df = df[df["region"].isin(regions)]
@@ -208,10 +210,10 @@ with tab2:
                 axis=1
             )]
 
-        df["Objectives"] = df["objective"].apply(bullets_to_text)
-        df["Results"] = df["results"].apply(bullets_to_text)
+        df["Objectives"] = df["objective"].apply(bullets_to_html)
+        df["Results"] = df["results"].apply(bullets_to_html)
 
-        # ---------------- TABLE (UNCHANGED RENDER STRATEGY) ----------------
+        # -------- TABLE (HTML RENDER FOR MULTILINE) --------
         st.markdown(
             df[[
                 "filename",
@@ -224,7 +226,7 @@ with tab2:
             unsafe_allow_html=True
         )
 
-        # ---------------- CONSULTANT'S BRAIN ----------------
+        # -------- CONSULTANT'S BRAIN --------
         st.markdown("## 🧠 Consultant’s Brain (Ask Like a Partner)")
         user_q = st.text_input(
             "Ask a strategic question",
@@ -232,13 +234,18 @@ with tab2:
         )
 
         if user_q:
-            q_vec = embedding_model.encode(user_q)
-            D, I = faiss_index.search(np.array([q_vec]).astype("float32"), k=5)
-            context = "\n".join([faiss_text_map[i] for i in I[0] if i < len(faiss_text_map)])
+            embedding_model, faiss_index, faiss_text_map = get_rag_components()
 
-            rag_prompt = f"""
-You are a senior consulting partner.
-Synthesize an answer using the evidence below.
+            if faiss_index.ntotal == 0:
+                st.warning("No documents indexed yet. Please process documents first.")
+            else:
+                q_vec = embedding_model.encode(user_q)
+                D, I = faiss_index.search(np.array([q_vec]).astype("float32"), k=5)
+                context = "\n".join([faiss_text_map[i] for i in I[0]])
+
+                rag_prompt = f"""
+You are a senior management consulting partner.
+Synthesize an insight-driven answer using the evidence below.
 
 QUESTION:
 {user_q}
@@ -246,10 +253,11 @@ QUESTION:
 EVIDENCE:
 {context}
 """
-            resp = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": rag_prompt}],
-                temperature=0.2
-            )
-            st.markdown("### 🔍 Partner Synthesis")
-            st.write(resp.choices[0].message.content)
+                resp = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": rag_prompt}],
+                    temperature=0.2
+                )
+
+                st.markdown("### 🔍 Partner Synthesis")
+                st.write(resp.choices[0].message.content)
